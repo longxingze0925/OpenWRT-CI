@@ -1,0 +1,733 @@
+#!/bin/sh
+
+CONFIG="vlanap"
+BACKUP_ROOT="/etc/vlanap/backup"
+SAFE_STATE="/tmp/vlanap-safe-rollback"
+MANAGED_FLAG="vlanap_managed"
+
+. /lib/functions.sh
+
+log() {
+	echo "vlanap: $*"
+}
+
+die() {
+	echo "vlanap: error: $*" >&2
+	exit 1
+}
+
+usage() {
+	cat <<'EOF'
+Usage: vlanap <command>
+
+Commands:
+  apply       Apply /etc/config/vlanap immediately.
+  apply-safe  Apply config and auto-rollback unless confirmed.
+  confirm     Confirm a safe apply and cancel rollback.
+  backup      Back up network, wireless, dhcp, and firewall configs.
+  restore     Restore the latest backup, or pass a backup directory.
+  status      Show vlanap config and generated state.
+EOF
+}
+
+valid_name() {
+	case "$1" in
+		""|*[!A-Za-z0-9_]*)
+			return 1
+			;;
+	esac
+	return 0
+}
+
+valid_device_name() {
+	case "$1" in
+		""|*[!A-Za-z0-9_.-]*)
+			return 1
+			;;
+	esac
+	return 0
+}
+
+valid_vlan_id() {
+	case "$1" in
+		""|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 4094 ] 2>/dev/null
+}
+
+valid_ipv4_or_empty() {
+	[ -z "$1" ] && return 0
+	case "$1" in
+		*.*.*.*)
+			return 0
+			;;
+	esac
+	return 1
+}
+
+append_unique() {
+	local var_name="$1"
+	local item="$2"
+	local current value
+
+	[ -n "$item" ] || return 0
+	eval "current=\"\${$var_name}\""
+
+	for value in $current; do
+		[ "$value" = "$item" ] && return 0
+	done
+
+	eval "$var_name=\"\$current \$item\""
+}
+contains_word() {
+	local needle="$1"
+	local value
+	shift
+
+	for value in "$@"; do
+		[ "$value" = "$needle" ] && return 0
+	done
+
+	return 1
+}
+
+assert_unique_word() {
+	local var_name="$1"
+	local item="$2"
+	local label="$3"
+	local current value
+
+	eval "current=\"\${$var_name}\""
+	for value in $current; do
+		[ "$value" = "$item" ] && die "duplicate $label: $item"
+	done
+
+	eval "$var_name=\"\$current \$item\""
+}
+
+collect_port() {
+	local port="$1"
+
+	valid_device_name "$port" || die "invalid port name: $port"
+	append_unique PORTS "$port"
+}
+
+validate_tagged_port() {
+	local port="$1"
+
+	valid_device_name "$port" || die "invalid tagged port in VLAN $CURRENT_VLAN_ID: $port"
+	assert_unique_word SECTION_PORTS "$port" "port in VLAN $CURRENT_VLAN_ID"
+	append_unique PORTS "$port"
+}
+
+validate_untagged_port() {
+	local port="$1"
+
+	valid_device_name "$port" || die "invalid untagged port in VLAN $CURRENT_VLAN_ID: $port"
+	[ "$port" != "$UPLINK" ] || die "uplink port $UPLINK must stay tagged, not untagged in VLAN $CURRENT_VLAN_ID"
+	assert_unique_word SECTION_PORTS "$port" "port in VLAN $CURRENT_VLAN_ID"
+	assert_unique_word ACCESS_PORTS "$port" "untagged access port"
+	append_unique PORTS "$port"
+}
+
+collect_vlan_section() {
+	VLAN_SECTIONS="$VLAN_SECTIONS $1"
+}
+
+collect_wifi_section() {
+	WIFI_SECTIONS="$WIFI_SECTIONS $1"
+}
+
+collect_radio_section() {
+	ALL_RADIOS="$ALL_RADIOS $1"
+}
+
+collect_wifi_radio() {
+	append_unique WIFI_RADIOS "$1"
+}
+
+load_vlanap_config() {
+	config_load "$CONFIG"
+
+	config_get ENABLED main enabled "0"
+	config_get BRIDGE main bridge "br-vlanap"
+	config_get UPLINK main uplink "lan1"
+	config_get MANAGE_NETWORK main manage_network ""
+	config_get MANAGE_VLAN main manage_vlan ""
+	config_get MANAGE_IP main manage_ip ""
+	config_get MANAGE_NETMASK main manage_netmask "255.255.255.0"
+	config_get GATEWAY main gateway ""
+	config_get DNS main dns ""
+	config_get SAFE_TIMEOUT main safe_timeout "180"
+	config_get DISABLE_EXISTING_WIFI main disable_existing_wifi "1"
+	config_get DISABLE_ALL_DHCP main disable_all_dhcp "1"
+	config_get MANAGE_FIREWALL_ZONE main manage_firewall_zone "vlanap_mgmt"
+
+	valid_device_name "$BRIDGE" || die "invalid bridge name: $BRIDGE"
+	valid_device_name "$UPLINK" || die "invalid uplink port: $UPLINK"
+	valid_name "$MANAGE_NETWORK" || die "invalid manage_network: $MANAGE_NETWORK"
+	valid_vlan_id "$MANAGE_VLAN" || die "invalid manage_vlan: $MANAGE_VLAN"
+	[ -n "$MANAGE_IP" ] || die "manage_ip is required"
+	valid_ipv4_or_empty "$MANAGE_IP" || die "invalid manage_ip: $MANAGE_IP"
+	valid_ipv4_or_empty "$GATEWAY" || die "invalid gateway: $GATEWAY"
+	valid_ipv4_or_empty "$DNS" || die "invalid dns: $DNS"
+	[ -z "$MANAGE_FIREWALL_ZONE" ] || valid_name "$MANAGE_FIREWALL_ZONE" || die "invalid manage_firewall_zone: $MANAGE_FIREWALL_ZONE"
+
+	case "$SAFE_TIMEOUT" in
+		""|*[!0-9]*)
+			die "invalid safe_timeout: $SAFE_TIMEOUT"
+			;;
+	esac
+
+	VLAN_SECTIONS=""
+	WIFI_SECTIONS=""
+	PORTS=""
+	NETWORKS=""
+	VLAN_IDS=""
+	ACCESS_PORTS=""
+
+	append_unique PORTS "$UPLINK"
+	config_foreach collect_vlan_section vlan
+	config_foreach collect_wifi_section wifi
+
+	[ -n "$VLAN_SECTIONS" ] || die "no vlan section found in /etc/config/vlanap"
+}
+
+validate_vlan_sections() {
+	local section id network manage_network_seen
+
+	manage_network_seen=0
+
+	for section in $VLAN_SECTIONS; do
+		config_get id "$section" id
+		config_get network "$section" network "$section"
+
+		valid_vlan_id "$id" || die "invalid VLAN id in section $section: $id"
+		valid_name "$network" || die "invalid network name in section $section: $network"
+		assert_unique_word VLAN_IDS "$id" "VLAN id"
+		assert_unique_word NETWORKS "$network" "network name"
+
+		if [ "$network" = "$MANAGE_NETWORK" ]; then
+			[ "$id" = "$MANAGE_VLAN" ] || die "manage_network $MANAGE_NETWORK uses VLAN $id, expected $MANAGE_VLAN"
+			manage_network_seen=1
+		fi
+
+		CURRENT_VLAN_ID="$id"
+		SECTION_PORTS=""
+		config_list_foreach "$section" tagged_port validate_tagged_port
+		config_list_foreach "$section" untagged_port validate_untagged_port
+	done
+
+	[ "$manage_network_seen" = "1" ] || die "manage_network $MANAGE_NETWORK not found in vlan sections"
+}
+
+validate_runtime_ports() {
+	local port
+
+	for port in $PORTS; do
+		[ -e "/sys/class/net/$port" ] || die "port not found on this device: $port"
+	done
+}
+
+validate_wifi_key() {
+	local section="$1"
+	local encryption="$2"
+	local key="$3"
+
+	case "$encryption" in
+		none|"")
+			return 0
+			;;
+	esac
+
+	[ ${#key} -ge 8 ] || die "wifi section $section requires a key with at least 8 characters"
+	[ "$key" != "change-this-password" ] || die "wifi section $section still uses the default key"
+}
+
+validate_wifi_sections() {
+	local section network ssid encryption key
+
+	for section in $WIFI_SECTIONS; do
+		config_get network "$section" network
+		config_get ssid "$section" ssid
+		config_get encryption "$section" encryption "psk2+ccmp"
+		config_get key "$section" key ""
+
+		valid_name "$network" || die "invalid wifi network in section $section: $network"
+		contains_word "$network" $NETWORKS || die "wifi section $section references unknown network: $network"
+		[ -n "$ssid" ] || die "missing ssid in wifi section $section"
+		validate_wifi_key "$section" "$encryption" "$key"
+	done
+}
+
+prepare_config() {
+	load_vlanap_config
+
+	[ "$ENABLED" = "1" ] || die "/etc/config/vlanap is disabled"
+
+	validate_vlan_sections
+	validate_runtime_ports
+	validate_wifi_sections
+}
+
+make_backup() {
+	local ts backup file
+
+	mkdir -p "$BACKUP_ROOT" || die "failed to create backup directory: $BACKUP_ROOT"
+	ts="$(date +%Y%m%d-%H%M%S)-$$"
+	backup="$BACKUP_ROOT/$ts"
+	mkdir -p "$backup" || die "failed to create backup directory: $backup"
+
+	for file in network wireless dhcp firewall; do
+		[ -f "/etc/config/$file" ] && cp -p "/etc/config/$file" "$backup/$file"
+	done
+
+	rm -f "$BACKUP_ROOT/latest"
+	ln -s "$backup" "$BACKUP_ROOT/latest" 2>/dev/null || true
+	echo "$backup"
+}
+
+reload_services() {
+	/etc/init.d/network reload >/dev/null 2>&1 || /etc/init.d/network restart >/dev/null 2>&1 || true
+	command -v wifi >/dev/null 2>&1 && wifi reload >/dev/null 2>&1 || true
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+}
+
+restore_from() {
+	local backup="$1"
+	local file
+
+	[ -d "$backup" ] || die "backup directory not found: $backup"
+
+	for file in network wireless dhcp firewall; do
+		[ -f "$backup/$file" ] && cp -p "$backup/$file" "/etc/config/$file"
+	done
+
+	reload_services
+	log "restored backup: $backup"
+}
+
+delete_managed_network_section() {
+	local section="$1"
+	local managed
+
+	config_get managed "$section" "$MANAGED_FLAG" "0"
+	[ "$managed" = "1" ] && uci -q delete "network.$section"
+}
+
+delete_managed_wireless_section() {
+	local section="$1"
+	local managed
+
+	config_get managed "$section" "$MANAGED_FLAG" "0"
+	[ "$managed" = "1" ] && uci -q delete "wireless.$section"
+}
+
+delete_managed_dhcp_section() {
+	local section="$1"
+	local managed
+
+	config_get managed "$section" "$MANAGED_FLAG" "0"
+	[ "$managed" = "1" ] && uci -q delete "dhcp.$section"
+}
+
+delete_managed_firewall_section() {
+	local section="$1"
+	local managed
+
+	config_get managed "$section" "$MANAGED_FLAG" "0"
+	[ "$managed" = "1" ] && uci -q delete "firewall.$section"
+}
+
+cleanup_managed_configs() {
+	config_load network
+	config_foreach delete_managed_network_section device
+	config_foreach delete_managed_network_section bridge-vlan
+	config_foreach delete_managed_network_section interface
+
+	config_load wireless
+	config_foreach delete_managed_wireless_section wifi-iface
+
+	config_load dhcp
+	config_foreach delete_managed_dhcp_section dhcp
+
+	if [ -f /etc/config/firewall ]; then
+		config_load firewall
+		config_foreach delete_managed_firewall_section zone
+	fi
+}
+
+detach_port_from_bridge() {
+	local section="$1"
+	local type name port
+
+	config_get type "$section" type
+	config_get name "$section" name
+
+	[ "$type" = "bridge" ] || return 0
+	[ "$name" = "$BRIDGE" ] && return 0
+
+	for port in $PORTS; do
+		uci -q del_list "network.$section.ports=$port"
+	done
+}
+
+detach_ports_from_existing_bridges() {
+	config_load network
+	config_foreach detach_port_from_bridge device
+}
+
+disable_existing_wifi_iface() {
+	local section="$1"
+	local managed
+
+	config_get managed "$section" "$MANAGED_FLAG" "0"
+	[ "$managed" = "1" ] && return 0
+	uci set "wireless.$section.disabled=1"
+}
+
+disable_existing_wifi_ifaces() {
+	[ "$DISABLE_EXISTING_WIFI" = "1" ] || return 0
+	config_load wireless
+	config_foreach disable_existing_wifi_iface wifi-iface
+}
+
+disable_dhcp_section() {
+	local section="$1"
+
+	uci set "dhcp.$section.ignore=1"
+	uci set "dhcp.$section.ra=disabled"
+	uci set "dhcp.$section.dhcpv6=disabled"
+	uci set "dhcp.$section.ndp=disabled"
+}
+
+disable_existing_dhcp_servers() {
+	[ "$DISABLE_ALL_DHCP" = "1" ] || return 0
+	config_load dhcp
+	config_foreach disable_dhcp_section dhcp
+}
+
+ensure_no_unmanaged_network_conflict() {
+	local network="$1"
+	local managed
+
+	if uci -q get "network.$network" >/dev/null; then
+		managed="$(uci -q get "network.$network.$MANAGED_FLAG" 2>/dev/null)"
+		[ "$managed" = "1" ] || die "network.$network already exists and is not managed by vlanap"
+	fi
+}
+
+create_bridge_device() {
+	local port
+
+	uci -q delete "network.vlanap_bridge"
+	uci set "network.vlanap_bridge=device"
+	uci set "network.vlanap_bridge.name=$BRIDGE"
+	uci set "network.vlanap_bridge.type=bridge"
+	uci set "network.vlanap_bridge.vlan_filtering=1"
+	uci set "network.vlanap_bridge.$MANAGED_FLAG=1"
+
+	for port in $PORTS; do
+		uci add_list "network.vlanap_bridge.ports=$port"
+	done
+}
+
+add_vlan_port_list() {
+	local section="$1"
+	local option="$2"
+	local suffix="$3"
+	local target="$4"
+
+	ADD_VLAN_PORT_SECTION="$section"
+	ADD_VLAN_PORT_SUFFIX="$suffix"
+	ADD_VLAN_PORT_TARGET="$target"
+	ADD_VLAN_PORT_COUNT=0
+	config_list_foreach "$section" "$option" add_vlan_port
+	[ "$ADD_VLAN_PORT_COUNT" -gt 0 ]
+}
+
+add_vlan_port() {
+	local port="$1"
+	local section="$ADD_VLAN_PORT_SECTION"
+	local suffix="$ADD_VLAN_PORT_SUFFIX"
+	local target="$ADD_VLAN_PORT_TARGET"
+
+	valid_device_name "$port" || die "invalid port name in $section: $port"
+	uci add_list "network.$target.ports=$port$suffix"
+	ADD_VLAN_PORT_COUNT=$((ADD_VLAN_PORT_COUNT + 1))
+}
+
+create_vlan_network() {
+	local section="$1"
+	local id network bridge_vlan_section
+
+	config_get id "$section" id
+	config_get network "$section" network "$section"
+	bridge_vlan_section="vlanap_bv_$network"
+
+	ensure_no_unmanaged_network_conflict "$network"
+
+	uci -q delete "network.$bridge_vlan_section"
+	uci set "network.$bridge_vlan_section=bridge-vlan"
+	uci set "network.$bridge_vlan_section.device=$BRIDGE"
+	uci set "network.$bridge_vlan_section.vlan=$id"
+	uci set "network.$bridge_vlan_section.$MANAGED_FLAG=1"
+
+	if ! add_vlan_port_list "$section" tagged_port ":t" "$bridge_vlan_section"; then
+		uci add_list "network.$bridge_vlan_section.ports=$UPLINK:t"
+	fi
+
+	add_vlan_port_list "$section" untagged_port ":u*" "$bridge_vlan_section" || true
+
+	uci -q delete "network.$network"
+	uci set "network.$network=interface"
+	uci set "network.$network.device=$BRIDGE.$id"
+	uci set "network.$network.$MANAGED_FLAG=1"
+
+	if [ "$network" = "$MANAGE_NETWORK" ]; then
+		uci set "network.$network.proto=static"
+		uci set "network.$network.ipaddr=$MANAGE_IP"
+		uci set "network.$network.netmask=$MANAGE_NETMASK"
+		[ -n "$GATEWAY" ] && uci set "network.$network.gateway=$GATEWAY"
+		[ -n "$DNS" ] && uci add_list "network.$network.dns=$DNS"
+	else
+		uci set "network.$network.proto=none"
+	fi
+}
+
+create_managed_dhcp_section() {
+	local network="$1"
+	local dhcp_section="vlanap_dhcp_$network"
+
+	uci -q delete "dhcp.$dhcp_section"
+	uci set "dhcp.$dhcp_section=dhcp"
+	uci set "dhcp.$dhcp_section.interface=$network"
+	uci set "dhcp.$dhcp_section.$MANAGED_FLAG=1"
+	disable_dhcp_section "$dhcp_section"
+}
+
+create_network_configs() {
+	local section network
+
+	detach_ports_from_existing_bridges
+	config_load "$CONFIG"
+	create_bridge_device
+
+	for section in $VLAN_SECTIONS; do
+		create_vlan_network "$section"
+	done
+
+	disable_existing_dhcp_servers
+
+	for network in $NETWORKS; do
+		create_managed_dhcp_section "$network"
+	done
+}
+
+create_wifi_iface() {
+	local section="$1"
+	local radio="$2"
+	local iface network ssid encryption key isolate hidden
+
+	config_get network "$section" network
+	config_get ssid "$section" ssid
+	config_get encryption "$section" encryption "psk2+ccmp"
+	config_get key "$section" key ""
+	config_get isolate "$section" isolate ""
+	config_get hidden "$section" hidden ""
+
+	iface="vlanap_${section}_${radio}"
+
+	uci -q delete "wireless.$iface"
+	uci set "wireless.$iface=wifi-iface"
+	uci set "wireless.$iface.device=$radio"
+	uci set "wireless.$iface.mode=ap"
+	uci set "wireless.$iface.network=$network"
+	uci set "wireless.$iface.ssid=$ssid"
+	uci set "wireless.$iface.encryption=$encryption"
+	uci set "wireless.$iface.$MANAGED_FLAG=1"
+
+	[ "$encryption" != "none" ] && [ -n "$key" ] && uci set "wireless.$iface.key=$key"
+	[ -n "$isolate" ] && uci set "wireless.$iface.isolate=$isolate"
+	[ -n "$hidden" ] && uci set "wireless.$iface.hidden=$hidden"
+}
+
+create_wireless_configs() {
+	local section radio
+
+	disable_existing_wifi_ifaces
+
+	config_load wireless
+	ALL_RADIOS=""
+	config_foreach collect_radio_section wifi-device
+
+	[ -n "$ALL_RADIOS" ] || {
+		log "no wifi-device section found, skipping wireless config"
+		return 0
+	}
+
+	config_load "$CONFIG"
+
+	for section in $WIFI_SECTIONS; do
+		WIFI_RADIOS=""
+		config_list_foreach "$section" radio collect_wifi_radio
+		[ -n "$WIFI_RADIOS" ] || WIFI_RADIOS="$ALL_RADIOS"
+
+		for radio in $WIFI_RADIOS; do
+			create_wifi_iface "$section" "$radio"
+		done
+	done
+}
+
+create_management_firewall_zone() {
+	[ -f /etc/config/firewall ] || return 0
+	[ -n "$MANAGE_FIREWALL_ZONE" ] || return 0
+
+	uci -q delete "firewall.vlanap_mgmt"
+	uci set "firewall.vlanap_mgmt=zone"
+	uci set "firewall.vlanap_mgmt.name=$MANAGE_FIREWALL_ZONE"
+	uci set "firewall.vlanap_mgmt.input=ACCEPT"
+	uci set "firewall.vlanap_mgmt.output=ACCEPT"
+	uci set "firewall.vlanap_mgmt.forward=REJECT"
+	uci add_list "firewall.vlanap_mgmt.network=$MANAGE_NETWORK"
+	uci set "firewall.vlanap_mgmt.$MANAGED_FLAG=1"
+}
+
+apply_config() {
+	cleanup_managed_configs
+	config_load "$CONFIG"
+	create_network_configs
+	create_wireless_configs
+	create_management_firewall_zone
+	uci commit network
+	uci commit wireless
+	uci commit dhcp
+	[ -f /etc/config/firewall ] && uci commit firewall
+	reload_services
+}
+
+start_safe_timer() {
+	local backup="$1"
+	local timeout="$2"
+	local rollback_cmd
+
+	echo "$backup" > "$SAFE_STATE"
+	rollback_cmd="sleep $timeout; if [ -f $SAFE_STATE ]; then backup_dir=\$(cat $SAFE_STATE 2>/dev/null); rm -f $SAFE_STATE; [ -n \"\$backup_dir\" ] && /usr/sbin/vlanap restore \"\$backup_dir\" >/dev/null 2>&1; fi"
+
+	if command -v nohup >/dev/null 2>&1; then
+		nohup sh -c "$rollback_cmd" >/dev/null 2>&1 &
+	else
+		(sh -c "$rollback_cmd") >/dev/null 2>&1 &
+	fi
+}
+
+cmd_apply() {
+	local backup
+
+	prepare_config
+	backup="$(make_backup)"
+	apply_config
+	rm -f "$SAFE_STATE"
+	log "applied config"
+	log "backup: $backup"
+}
+
+cmd_apply_safe() {
+	local backup
+
+	prepare_config
+	backup="$(make_backup)"
+	start_safe_timer "$backup" "$SAFE_TIMEOUT"
+	apply_config
+	log "applied config with ${SAFE_TIMEOUT}s rollback timer"
+	log "run 'vlanap confirm' after reconnecting"
+	log "backup: $backup"
+}
+
+cmd_confirm() {
+	if [ -f "$SAFE_STATE" ]; then
+		rm -f "$SAFE_STATE"
+		log "safe apply confirmed"
+	else
+		log "no pending safe apply"
+	fi
+}
+
+cmd_restore() {
+	local backup="$1"
+
+	[ -n "$backup" ] || backup="$BACKUP_ROOT/latest"
+	restore_from "$backup"
+	rm -f "$SAFE_STATE"
+}
+
+show_vlan_status() {
+	local section id network
+
+	for section in $VLAN_SECTIONS; do
+		config_get id "$section" id
+		config_get network "$section" network "$section"
+		echo "  VLAN $id -> $network"
+	done
+}
+
+show_generated_interfaces() {
+	local section proto device
+
+	for section in $(uci -q show network | sed -n "s/^network\.\([^.=]*\)\.$MANAGED_FLAG='1'.*/\1/p"); do
+		config_get proto "$section" proto "-"
+		config_get device "$section" device "-"
+		echo "  network.$section proto=$proto device=$device"
+	done
+}
+
+cmd_status() {
+	load_vlanap_config
+	echo "enabled: $ENABLED"
+	echo "bridge: $BRIDGE"
+	echo "uplink: $UPLINK"
+	echo "management: $MANAGE_NETWORK vlan=$MANAGE_VLAN ip=$MANAGE_IP"
+	echo "safe timeout: $SAFE_TIMEOUT"
+	echo "configured VLANs:"
+	show_vlan_status
+	echo "generated network sections:"
+	config_load network
+	show_generated_interfaces
+	if [ -f "$SAFE_STATE" ]; then
+		echo "safe rollback: pending ($(cat "$SAFE_STATE" 2>/dev/null))"
+	else
+		echo "safe rollback: none"
+	fi
+}
+
+case "$1" in
+	apply)
+		cmd_apply
+		;;
+	apply-safe)
+		cmd_apply_safe
+		;;
+	confirm)
+		cmd_confirm
+		;;
+	backup)
+		make_backup
+		;;
+	restore)
+		shift
+		cmd_restore "$1"
+		;;
+	status)
+		cmd_status
+		;;
+	-h|--help|help|"")
+		usage
+		;;
+	*)
+		usage >&2
+		exit 1
+		;;
+esac
