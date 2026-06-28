@@ -1,2 +1,11 @@
 *.txt text eol=lf
 *.sh text eol=lf
+Makefile text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+CustomPackages/vlanap-core/files/usr/sbin/vlanap text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+CustomPackages/**/files/etc/config/* text eol=lf
+CustomPackages/**/files/usr/sbin/* text eol=lf
+.gitattributes text eol=lf

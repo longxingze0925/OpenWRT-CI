@@ -24,7 +24,9 @@ Commands:
   apply       Apply /etc/config/vlanap immediately.
   apply-safe  Apply config and auto-rollback unless confirmed.
   confirm     Confirm a safe apply and cancel rollback.
-  backup      Back up network, wireless, dhcp, and firewall configs.
+  preset      Create a RouterOS trunk preset in /etc/config/vlanap.
+  quick-apply Create the preset and apply it with safe rollback.
+  backup      Back up network, wireless, dhcp, firewall, and dropbear configs.
   restore     Restore the latest backup, or pass a backup directory.
   status      Show vlanap config and generated state.
 EOF
@@ -231,6 +233,13 @@ validate_runtime_ports() {
 	done
 }
 
+validate_plain_wifi_key() {
+	local key="$1"
+
+	[ ${#key} -ge 8 ] || die "wifi key requires at least 8 characters"
+	[ "$key" != "change-this-password" ] || die "wifi key still uses the default value"
+}
+
 validate_wifi_key() {
 	local section="$1"
 	local encryption="$2"
@@ -280,7 +289,7 @@ make_backup() {
 	backup="$BACKUP_ROOT/$ts"
 	mkdir -p "$backup" || die "failed to create backup directory: $backup"
 
-	for file in network wireless dhcp firewall; do
+	for file in network wireless dhcp firewall dropbear; do
 		[ -f "/etc/config/$file" ] && cp -p "/etc/config/$file" "$backup/$file"
 	done
 
@@ -294,6 +303,7 @@ reload_services() {
 	command -v wifi >/dev/null 2>&1 && wifi reload >/dev/null 2>&1 || true
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	/etc/init.d/dropbear restart >/dev/null 2>&1 || true
 }
 
 restore_from() {
@@ -302,7 +312,7 @@ restore_from() {
 
 	[ -d "$backup" ] || die "backup directory not found: $backup"
 
-	for file in network wireless dhcp firewall; do
+	for file in network wireless dhcp firewall dropbear; do
 		[ -f "$backup/$file" ] && cp -p "$backup/$file" "/etc/config/$file"
 	done
 
@@ -596,12 +606,25 @@ create_management_firewall_zone() {
 	uci set "firewall.vlanap_mgmt.$MANAGED_FLAG=1"
 }
 
+configure_dropbear_access() {
+	local section
+
+	[ -f /etc/config/dropbear ] || return 0
+
+	for section in $(uci -q show dropbear | sed -n "s/^dropbear\.\([^.=]*\)=dropbear.*/\1/p"); do
+		uci -q delete "dropbear.$section.Interface"
+	done
+
+	uci commit dropbear
+}
+
 apply_config() {
 	cleanup_managed_configs
 	config_load "$CONFIG"
 	create_network_configs
 	create_wireless_configs
 	create_management_firewall_zone
+	configure_dropbear_access
 	uci commit network
 	uci commit wireless
 	uci commit dhcp
@@ -654,6 +677,98 @@ cmd_confirm() {
 	else
 		log "no pending safe apply"
 	fi
+}
+
+delete_vlanap_sections() {
+	local section
+
+	config_load "$CONFIG"
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=.*/\1/p"); do
+		uci -q delete "$CONFIG.$section"
+	done
+}
+
+add_preset_vlan() {
+	local section="$1"
+	local id="$2"
+	local network="$3"
+	local access_port="$4"
+
+	uci set "$CONFIG.$section=vlan"
+	uci set "$CONFIG.$section.id=$id"
+	uci set "$CONFIG.$section.network=$network"
+	uci add_list "$CONFIG.$section.tagged_port=$UPLINK"
+	[ -n "$access_port" ] && uci add_list "$CONFIG.$section.untagged_port=$access_port"
+}
+
+add_preset_wifi() {
+	local section="$1"
+	local network="$2"
+	local ssid="$3"
+	local key="$4"
+
+	uci set "$CONFIG.$section=wifi"
+	uci set "$CONFIG.$section.network=$network"
+	uci set "$CONFIG.$section.ssid=$ssid"
+	uci set "$CONFIG.$section.encryption=psk2+ccmp"
+	uci set "$CONFIG.$section.key=$key"
+}
+
+write_routeros_basic_preset() {
+	local key="$1"
+
+	[ -n "$key" ] || key="change-this-password"
+
+	delete_vlanap_sections
+
+	UPLINK="lan1"
+	uci set "$CONFIG.main=global"
+	uci set "$CONFIG.main.enabled=1"
+	uci set "$CONFIG.main.bridge=br-vlanap"
+	uci set "$CONFIG.main.uplink=$UPLINK"
+	uci set "$CONFIG.main.manage_network=home"
+	uci set "$CONFIG.main.manage_vlan=10"
+	uci set "$CONFIG.main.manage_ip=172.16.10.2"
+	uci set "$CONFIG.main.manage_netmask=255.255.255.0"
+	uci set "$CONFIG.main.gateway=172.16.10.1"
+	uci set "$CONFIG.main.dns=172.16.10.1"
+	uci set "$CONFIG.main.safe_timeout=180"
+	uci set "$CONFIG.main.disable_existing_wifi=1"
+	uci set "$CONFIG.main.disable_all_dhcp=1"
+	uci set "$CONFIG.main.manage_firewall_zone=vlanap_mgmt"
+
+	add_preset_vlan home 10 home lan2
+	add_preset_vlan iot 30 iot lan3
+	add_preset_vlan guest 40 guest lan4
+
+	add_preset_wifi home_wifi home Home "$key"
+	add_preset_wifi iot_wifi iot IoT "$key"
+	add_preset_wifi guest_wifi guest Guest "$key"
+
+	uci commit "$CONFIG"
+	log "routeros-basic preset saved"
+}
+
+cmd_preset() {
+	local mode="${1:-routeros-basic}"
+	local key="$2"
+
+	case "$mode" in
+		routeros-basic|basic)
+			write_routeros_basic_preset "$key"
+			;;
+		*)
+			die "unknown preset: $mode"
+			;;
+	esac
+}
+
+cmd_quick_apply() {
+	local key="$1"
+
+	validate_plain_wifi_key "$key"
+	write_routeros_basic_preset "$key"
+	cmd_apply_safe
 }
 
 cmd_restore() {
@@ -712,6 +827,14 @@ case "$1" in
 		;;
 	confirm)
 		cmd_confirm
+		;;
+	preset)
+		shift
+		cmd_preset "$@"
+		;;
+	quick-apply)
+		shift
+		cmd_quick_apply "$@"
 		;;
 	backup)
 		make_backup

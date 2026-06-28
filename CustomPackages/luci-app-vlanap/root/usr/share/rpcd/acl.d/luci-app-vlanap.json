@@ -1,0 +1,19 @@
+{
+	"luci-app-vlanap": {
+		"description": "Grant access to VLAN AP configuration",
+		"read": {
+			"uci": [ "vlanap" ],
+			"ubus": {
+				"file": [ "exec" ],
+				"uci": [ "get" ]
+			}
+		},
+		"write": {
+			"uci": [ "vlanap" ],
+			"ubus": {
+				"file": [ "exec" ],
+				"uci": [ "add", "apply", "confirm", "delete", "set" ]
+			}
+		}
+	}
+}
