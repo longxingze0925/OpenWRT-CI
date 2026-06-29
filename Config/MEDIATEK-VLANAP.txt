@@ -23,5 +23,5 @@ CONFIG_LUCI_LANG_zh_Hans=y
 #专用固件不编译普通路由器后台模块
 CONFIG_PACKAGE_luci-app-firewall=n
 CONFIG_PACKAGE_luci-mod-network=n
-CONFIG_PACKAGE_luci-mod-status=n
+CONFIG_PACKAGE_luci-mod-status=y
 CONFIG_PACKAGE_luci-mod-system=n
