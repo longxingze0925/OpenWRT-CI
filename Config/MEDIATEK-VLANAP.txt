@@ -24,4 +24,4 @@ CONFIG_LUCI_LANG_zh_Hans=y
 CONFIG_PACKAGE_luci-app-firewall=n
 CONFIG_PACKAGE_luci-mod-network=n
 CONFIG_PACKAGE_luci-mod-status=y
-CONFIG_PACKAGE_luci-mod-system=n
+CONFIG_PACKAGE_luci-mod-system=y

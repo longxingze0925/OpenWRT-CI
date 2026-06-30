@@ -1,10 +1,23 @@
 {
-	"admin/status/overview": {
+	"admin/vlanap": {
+		"title": "VLAN AP",
+		"order": 1,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-vlanap" ]
+		}
+	},
+	"admin/vlanap/settings": {
 		"title": "VLAN AP 设置",
 		"order": 1,
 		"action": {
 			"type": "view",
 			"path": "vlanap/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-vlanap" ]
 		}
 	}
 }
