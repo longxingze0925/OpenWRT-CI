@@ -105,10 +105,14 @@ return view.extend({
 
 		o = s.option(form.Flag, 'enabled', _('启用'));
 		o.default = '1';
-
 		o = s.option(form.Value, 'bridge', _('Bridge'));
 		o.default = 'br-vlanap';
-		o.datatype = 'uciname';
+		o.validate = function(section_id, value) {
+			if (/^[A-Za-z0-9_.-]{1,15}$/.test(value))
+				return true;
+
+			return _('请输入合法的 Linux 网桥名，例如 br-vlanap。');
+		};
 
 		o = s.option(form.Value, 'uplink', _('RouterOS 上联口'));
 		o.default = 'lan1';
