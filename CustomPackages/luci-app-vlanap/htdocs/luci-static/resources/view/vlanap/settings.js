@@ -42,7 +42,7 @@ return view.extend({
 			return Promise.resolve();
 		}
 
-		return this.runVlanap([ 'quick-apply', key ], _('已安全应用。网络可能会切换到 172.16.10.2，请重新登录后点击“确认应用”。'));
+		return this.runVlanap([ 'quick-apply', key ], _('已安全应用。网络会切换到管理网 172.16.254.254，请重新登录后点击“确认应用”。'));
 	},
 
 	handleApplySafe: function() {
@@ -53,10 +53,56 @@ return view.extend({
 		return this.runVlanap([ 'confirm' ], _('已确认应用，不会自动回滚。'));
 	},
 
+	handleBatchGenerate: function() {
+		var key = document.querySelector('#vlanap_batch_key').value;
+		var mode = document.querySelector('#vlanap_batch_append').checked ? 'append' : 'replace';
+		var macMode = document.querySelector('#vlanap_batch_mac_mode').value || 'auto';
+		var args = [
+			'batch-generate',
+			document.querySelector('#vlanap_batch_start').value || '1',
+			document.querySelector('#vlanap_batch_count').value || '4',
+			document.querySelector('#vlanap_batch_step').value || '1',
+			document.querySelector('#vlanap_batch_network_prefix').value || 'vlan',
+			document.querySelector('#vlanap_batch_ssid_prefix').value || 'WiFi',
+			key,
+			document.querySelector('#vlanap_batch_uplink').value || 'lan1',
+			document.querySelector('#vlanap_batch_access_ports').value || '',
+			macMode,
+			mode,
+			document.querySelector('#vlanap_manage_vlan').value || '254',
+			document.querySelector('#vlanap_manage_port').value || 'lan2',
+			document.querySelector('#vlanap_ip_prefix').value || '172.16',
+			document.querySelector('#vlanap_gateway_host').value || '1',
+			document.querySelector('#vlanap_manage_host').value || '254'
+		];
+
+		if (!key || key.length < 8) {
+			ui.addNotification(null, E('p', {}, _('Wi-Fi 密码至少需要 8 位。')), 'danger');
+			return Promise.resolve();
+		}
+
+		return this.runVlanap(args, _('已批量生成 VLAN 和 Wi-Fi 配置，请检查后点击“安全应用”。')).then(function() {
+			window.setTimeout(function() { window.location.reload(); }, 800);
+		});
+	},
+
+	handleGenerateAllMac: function() {
+		var macMode = document.querySelector('#vlanap_batch_mac_mode').value || 'random';
+		return this.runVlanap([ 'mac-generate', 'all', macMode ], _('已为所有 Wi-Fi 生成新的 MAC，请检查后点击“安全应用”。')).then(function() {
+			window.setTimeout(function() { window.location.reload(); }, 800);
+		});
+	},
+
+	handleClearAllMac: function() {
+		return this.runVlanap([ 'mac-clear', 'all' ], _('已清空所有 Wi-Fi MAC，应用后由驱动自动分配。')).then(function() {
+			window.setTimeout(function() { window.location.reload(); }, 800);
+		});
+	},
+
 	renderQuickPanel: function(statusText) {
 		return E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('快速创建')),
-			E('div', { 'class': 'cbi-section-descr' }, _('默认方案：lan1 接 RouterOS trunk，lan2 是 VLAN 10 管理口，lan3 是 VLAN 30 IoT 口，lan4 是 VLAN 40 访客口。')),
+			E('div', { 'class': 'cbi-section-descr' }, _('默认方案：lan1 接 RouterOS trunk，WiFi-1..WiFi-4 是业务网，WiFi-254/VLAN 254 是管理网，lan2 是管理口。')),
 			E('div', { 'class': 'cbi-value' }, [
 				E('label', { 'class': 'cbi-value-title', 'for': 'vlanap_quick_key' }, _('Wi-Fi 密码')),
 				E('div', { 'class': 'cbi-value-field' }, [
@@ -89,6 +135,70 @@ return view.extend({
 					'click': ui.createHandlerFn(this, 'handleConfirm')
 				}, _('确认应用'))
 			]),
+			E('h3', {}, _('批量生成 VLAN 和 Wi-Fi')),
+			E('div', { 'class': 'cbi-section-descr' }, _('批量生成只写入配置，不会立即改网络。检查无误后再点击“安全应用”。')),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('VLAN 参数')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'vlanap_batch_start', 'class': 'cbi-input-text', 'type': 'number', 'min': '1', 'max': '4094', 'value': '1', 'style': 'width: 7em' }),
+					' ',
+					E('input', { 'id': 'vlanap_batch_count', 'class': 'cbi-input-text', 'type': 'number', 'min': '1', 'max': '32', 'value': '4', 'style': 'width: 7em' }),
+					' ',
+					E('input', { 'id': 'vlanap_batch_step', 'class': 'cbi-input-text', 'type': 'number', 'min': '1', 'value': '1', 'style': 'width: 7em' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('命名')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'vlanap_batch_network_prefix', 'class': 'cbi-input-text', 'value': 'vlan', 'placeholder': 'vlan' }),
+					' ',
+					E('input', { 'id': 'vlanap_batch_ssid_prefix', 'class': 'cbi-input-text', 'value': 'WiFi', 'placeholder': 'WiFi' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('端口和密码')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'vlanap_batch_uplink', 'class': 'cbi-input-text', 'value': 'lan1', 'placeholder': 'lan1', 'style': 'width: 7em' }),
+					' ',
+					E('input', { 'id': 'vlanap_batch_access_ports', 'class': 'cbi-input-text', 'value': 'lan3,lan4', 'placeholder': 'lan3,lan4' }),
+					' ',
+					E('input', { 'id': 'vlanap_batch_key', 'class': 'cbi-input-password', 'type': 'password', 'placeholder': _('Wi-Fi 密码') })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('管理网')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('input', { 'id': 'vlanap_manage_vlan', 'class': 'cbi-input-text', 'type': 'number', 'min': '1', 'max': '4094', 'value': '254', 'style': 'width: 7em' }),
+					' ',
+					E('input', { 'id': 'vlanap_manage_port', 'class': 'cbi-input-text', 'value': 'lan2', 'placeholder': 'lan2', 'style': 'width: 7em' }),
+					' ',
+					E('input', { 'id': 'vlanap_ip_prefix', 'class': 'cbi-input-text', 'value': '172.16', 'placeholder': '172.16', 'style': 'width: 7em' }),
+					' ',
+					E('input', { 'id': 'vlanap_gateway_host', 'class': 'cbi-input-text', 'type': 'number', 'min': '1', 'max': '254', 'value': '1', 'style': 'width: 6em' }),
+					' ',
+					E('input', { 'id': 'vlanap_manage_host', 'class': 'cbi-input-text', 'type': 'number', 'min': '1', 'max': '254', 'value': '254', 'style': 'width: 6em' })
+				])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('选项')),
+				E('div', { 'class': 'cbi-value-field' }, [
+					E('select', { 'id': 'vlanap_batch_mac_mode', 'class': 'cbi-input-select' }, [
+						E('option', { 'value': 'auto', 'selected': 'selected' }, _('自动 MAC')),
+						E('option', { 'value': 'random' }, _('普通随机')),
+						E('option', { 'value': 'ap' }, _('商用 AP')),
+						E('option', { 'value': 'vendor' }, _('厂家 OUI'))
+					]),
+					' ',
+					E('label', {}, [ E('input', { 'id': 'vlanap_batch_append', 'type': 'checkbox' }), ' ', _('追加') ])
+				])
+			]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(this, 'handleBatchGenerate') }, _('批量生成')),
+				' ',
+				E('button', { 'class': 'btn cbi-button cbi-button-save', 'click': ui.createHandlerFn(this, 'handleGenerateAllMac') }, _('全部换一批 MAC')),
+				' ',
+				E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': ui.createHandlerFn(this, 'handleClearAllMac') }, _('全部清空 MAC'))
+			]),
 			E('h3', {}, _('当前状态')),
 			E('pre', { 'style': 'white-space: pre-wrap; max-height: 260px; overflow: auto;' }, statusText || _('暂无状态'))
 		]);
@@ -119,15 +229,15 @@ return view.extend({
 		o.placeholder = 'lan1';
 
 		o = s.option(form.Value, 'manage_network', _('管理网络'));
-		o.default = 'home';
+		o.default = 'vlan254';
 		o.datatype = 'uciname';
 
 		o = s.option(form.Value, 'manage_vlan', _('管理 VLAN'));
-		o.default = '10';
+		o.default = '254';
 		o.datatype = 'range(1,4094)';
 
 		o = s.option(form.Value, 'manage_ip', _('管理 IP'));
-		o.default = '172.16.10.2';
+		o.default = '172.16.254.254';
 		o.datatype = 'ip4addr';
 
 		o = s.option(form.Value, 'manage_netmask', _('子网掩码'));
@@ -135,11 +245,11 @@ return view.extend({
 		o.datatype = 'ip4addr';
 
 		o = s.option(form.Value, 'gateway', _('网关'));
-		o.default = '172.16.10.1';
+		o.default = '172.16.254.1';
 		o.datatype = 'or(ip4addr,blank)';
 
 		o = s.option(form.Value, 'dns', _('DNS'));
-		o.default = '172.16.10.1';
+		o.default = '172.16.254.1';
 		o.datatype = 'or(ip4addr,blank)';
 
 		o = s.option(form.Value, 'safe_timeout', _('安全回滚秒数'));
@@ -192,6 +302,42 @@ return view.extend({
 		o.password = true;
 		o.depends('encryption', 'psk2+ccmp');
 		o.depends('encryption', 'sae-mixed');
+
+		o = s.option(form.Value, 'macaddr', _('MAC 地址'));
+		o.placeholder = _('自动');
+		o.validate = function(section_id, value) {
+			var first;
+
+			if (!value)
+				return true;
+
+			if (!/^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/.test(value))
+				return _('请输入合法的 MAC 地址。');
+
+			first = parseInt(value.substr(0, 2), 16);
+			if (first & 1)
+				return _('MAC 必须是单播地址。');
+
+			return true;
+		};
+
+		o = s.option(form.Button, '_mac_generate', _('换 MAC'));
+		o.inputtitle = _('生成');
+		o.inputstyle = 'apply';
+		o.onclick = L.bind(function(section_id) {
+			return this.runVlanap([ 'mac-generate', section_id, 'random' ], _('已生成新的随机 MAC，请检查后点击“安全应用”。')).then(function() {
+				window.setTimeout(function() { window.location.reload(); }, 800);
+			});
+		}, this);
+
+		o = s.option(form.Button, '_mac_clear', _('清空 MAC'));
+		o.inputtitle = _('清空');
+		o.inputstyle = 'reset';
+		o.onclick = L.bind(function(section_id) {
+			return this.runVlanap([ 'mac-clear', section_id ], _('已清空 MAC，应用后由驱动自动分配。')).then(function() {
+				window.setTimeout(function() { window.location.reload(); }, 800);
+			});
+		}, this);
 
 		o = s.option(form.Flag, 'isolate', _('客户端隔离'));
 		o.default = '0';

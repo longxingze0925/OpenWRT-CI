@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=vlanap-core
-PKG_VERSION:=0.2.0
+PKG_VERSION:=0.4.0
 PKG_RELEASE:=1
 PKG_MAINTAINER:=longxingze0925
 
@@ -29,6 +29,8 @@ define Package/vlanap-core/install
 	$(INSTALL_CONF) ./files/etc/config/vlanap $(1)/etc/config/vlanap
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/usr/sbin/vlanap $(1)/usr/sbin/vlanap
+	$(INSTALL_DIR) $(1)/usr/share/vlanap
+	$(INSTALL_DATA) ./files/usr/share/vlanap/oui-router-ap.txt $(1)/usr/share/vlanap/oui-router-ap.txt
 endef
 
 $(eval $(call BuildPackage,vlanap-core))

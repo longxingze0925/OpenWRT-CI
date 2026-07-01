@@ -4,6 +4,7 @@ CONFIG="vlanap"
 BACKUP_ROOT="/etc/vlanap/backup"
 SAFE_STATE="/tmp/vlanap-safe-rollback"
 MANAGED_FLAG="vlanap_managed"
+OUI_FILE="/usr/share/vlanap/oui-router-ap.txt"
 
 . /lib/functions.sh
 
@@ -26,6 +27,10 @@ Commands:
   confirm     Confirm a safe apply and cancel rollback.
   preset      Create a RouterOS trunk preset in /etc/config/vlanap.
   quick-apply Create the preset and apply it with safe rollback.
+  batch-generate Create business VLAN/Wi-Fi sections plus a management Wi-Fi.
+  mac-generate Generate persistent Wi-Fi MACs.
+  mac-clear   Clear configured Wi-Fi MAC.
+  wifi-status Show configured and running Wi-Fi MAC addresses.
   backup      Back up network, wireless, dhcp, firewall, and dropbear configs.
   restore     Restore the latest backup, or pass a backup directory.
   status      Show vlanap config and generated state.
@@ -67,6 +72,32 @@ valid_ipv4_or_empty() {
 			;;
 	esac
 	return 1
+}
+
+valid_mac_or_empty() {
+	[ -z "$1" ] && return 0
+
+	case "$1" in
+		[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f])
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+normalize_mac() {
+	echo "$1" | tr 'A-F' 'a-f'
+}
+
+is_unicast_mac() {
+	local first
+
+	valid_mac_or_empty "$1" || return 1
+	[ -n "$1" ] || return 1
+
+	first=$((0x$(echo "$1" | cut -d: -f1)))
+	[ $((first & 1)) -eq 0 ]
 }
 
 append_unique() {
@@ -256,18 +287,21 @@ validate_wifi_key() {
 }
 
 validate_wifi_sections() {
-	local section network ssid encryption key
+	local section network ssid encryption key macaddr
 
 	for section in $WIFI_SECTIONS; do
 		config_get network "$section" network
 		config_get ssid "$section" ssid
 		config_get encryption "$section" encryption "psk2+ccmp"
 		config_get key "$section" key ""
+		config_get macaddr "$section" macaddr ""
 
 		valid_name "$network" || die "invalid wifi network in section $section: $network"
 		contains_word "$network" $NETWORKS || die "wifi section $section references unknown network: $network"
 		[ -n "$ssid" ] || die "missing ssid in wifi section $section"
 		validate_wifi_key "$section" "$encryption" "$key"
+		valid_mac_or_empty "$macaddr" || die "invalid macaddr in wifi section $section: $macaddr"
+		[ -z "$macaddr" ] || is_unicast_mac "$macaddr" || die "wifi section $section macaddr must be a unicast MAC: $macaddr"
 	done
 }
 
@@ -540,7 +574,8 @@ create_network_configs() {
 create_wifi_iface() {
 	local section="$1"
 	local radio="$2"
-	local iface network ssid encryption key isolate hidden
+	local radio_index="${3:-0}"
+	local iface network ssid encryption key isolate hidden macaddr iface_mac
 
 	config_get network "$section" network
 	config_get ssid "$section" ssid
@@ -548,6 +583,7 @@ create_wifi_iface() {
 	config_get key "$section" key ""
 	config_get isolate "$section" isolate ""
 	config_get hidden "$section" hidden ""
+	config_get macaddr "$section" macaddr ""
 
 	iface="vlanap_${section}_${radio}"
 
@@ -563,10 +599,14 @@ create_wifi_iface() {
 	[ "$encryption" != "none" ] && [ -n "$key" ] && uci set "wireless.$iface.key=$key"
 	[ -n "$isolate" ] && uci set "wireless.$iface.isolate=$isolate"
 	[ -n "$hidden" ] && uci set "wireless.$iface.hidden=$hidden"
+	if [ -n "$macaddr" ]; then
+		iface_mac="$(mac_add "$macaddr" "$radio_index")"
+		uci set "wireless.$iface.macaddr=$iface_mac"
+	fi
 }
 
 create_wireless_configs() {
-	local section radio
+	local section radio radio_index
 
 	disable_existing_wifi_ifaces
 
@@ -583,15 +623,16 @@ create_wireless_configs() {
 
 	for section in $WIFI_SECTIONS; do
 		WIFI_RADIOS=""
+		radio_index=0
 		config_list_foreach "$section" radio collect_wifi_radio
 		[ -n "$WIFI_RADIOS" ] || WIFI_RADIOS="$ALL_RADIOS"
 
 		for radio in $WIFI_RADIOS; do
-			create_wifi_iface "$section" "$radio"
+			create_wifi_iface "$section" "$radio" "$radio_index"
+			radio_index=$((radio_index + 1))
 		done
 	done
 }
-
 create_management_firewall_zone() {
 	[ -f /etc/config/firewall ] || return 0
 	[ -n "$MANAGE_FIREWALL_ZONE" ] || return 0
@@ -706,16 +747,537 @@ add_preset_wifi() {
 	local network="$2"
 	local ssid="$3"
 	local key="$4"
+	local macaddr="$5"
 
 	uci set "$CONFIG.$section=wifi"
 	uci set "$CONFIG.$section.network=$network"
 	uci set "$CONFIG.$section.ssid=$ssid"
 	uci set "$CONFIG.$section.encryption=psk2+ccmp"
 	uci set "$CONFIG.$section.key=$key"
+	[ -n "$macaddr" ] && uci set "$CONFIG.$section.macaddr=$macaddr"
 }
 
+random_byte_hex() {
+	local byte
+
+	byte="$(od -An -N1 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+	case "$byte" in
+		[0-9a-f][0-9a-f])
+			echo "$byte"
+			;;
+		*)
+			printf '%02x\n' $((( $(date +%s) + $$ ) & 255))
+			;;
+	esac
+}
+
+generate_random_mac() {
+	local first b2 b3 b4 b5 b6
+
+	first="$(random_byte_hex)"
+	b2="$(random_byte_hex)"
+	b3="$(random_byte_hex)"
+	b4="$(random_byte_hex)"
+	b5="$(random_byte_hex)"
+	b6="$(random_byte_hex)"
+	first=$(((0x$first & 252) | 2))
+
+	printf '%02x:%s:%s:%s:%s:%s\n' "$first" "$b2" "$b3" "$b4" "$b5" "$b6"
+}
+
+generate_laa_group_base() {
+	local first b2 b3 b4 b5
+
+	first="$(random_byte_hex)"
+	b2="$(random_byte_hex)"
+	b3="$(random_byte_hex)"
+	b4="$(random_byte_hex)"
+	b5="$(random_byte_hex)"
+	first=$(((0x$first & 252) | 2))
+
+	printf '%02x:%s:%s:%s:%s:00\n' "$first" "$b2" "$b3" "$b4" "$b5"
+}
+
+select_vendor_oui() {
+	local line
+
+	if [ -f "$OUI_FILE" ]; then
+		line="$(awk 'BEGIN { srand() } /^[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f][[:space:]]/ { if (rand() * ++n < 1) line=$0 } END { print line }' "$OUI_FILE")"
+	fi
+
+	[ -n "$line" ] || line="50:c7:bf TP-Link"
+	echo "$line"
+}
+
+prepare_vendor_group_base() {
+	local line oui b4 b5
+
+	line="$(select_vendor_oui)"
+	oui="$(echo "$line" | awk '{ print $1 }' | tr 'A-F' 'a-f')"
+	MAC_VENDOR="$(echo "$line" | cut -d' ' -f2-)"
+	b4="$(random_byte_hex)"
+	b5="$(random_byte_hex)"
+	MAC_BASE="$(printf '%s:%s:%s:00\n' "$oui" "$b4" "$b5")"
+}
+
+normalize_mac_mode() {
+	case "$1" in
+		""|auto)
+			echo auto
+			;;
+		random|laa)
+			echo random
+			;;
+		ap|vendor)
+			echo "$1"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+mac_add() {
+	local mac="$1"
+	local offset="${2:-0}"
+	local b1 b2 b3 b4 b5 b6 n carry
+
+	valid_mac_or_empty "$mac" || die "invalid macaddr: $mac"
+	case "$offset" in
+		""|*[!0-9]*) die "invalid MAC offset: $offset" ;;
+	esac
+
+	b1="$(echo "$mac" | cut -d: -f1)"
+	b2="$(echo "$mac" | cut -d: -f2)"
+	b3="$(echo "$mac" | cut -d: -f3)"
+	b4="$(echo "$mac" | cut -d: -f4)"
+	b5="$(echo "$mac" | cut -d: -f5)"
+	b6="$(echo "$mac" | cut -d: -f6)"
+
+	n=$((0x$b6 + offset)); b6=$((n & 255)); carry=$((n >> 8))
+	n=$((0x$b5 + carry)); b5=$((n & 255)); carry=$((n >> 8))
+	n=$((0x$b4 + carry)); b4=$((n & 255)); carry=$((n >> 8))
+	n=$((0x$b3 + carry)); b3=$((n & 255)); carry=$((n >> 8))
+	n=$((0x$b2 + carry)); b2=$((n & 255)); carry=$((n >> 8))
+	n=$((0x$b1 + carry)); b1=$((n & 255))
+
+	printf '%02x:%02x:%02x:%02x:%02x:%02x\n' "$b1" "$b2" "$b3" "$b4" "$b5" "$b6"
+}
+
+mac_is_known() {
+	local mac value
+
+	mac="$(normalize_mac "$1")"
+	for value in $GENERATED_MACS; do
+		[ "$value" = "$mac" ] && return 0
+	done
+
+	return 1
+}
+
+remember_mac() {
+	append_unique GENERATED_MACS "$(normalize_mac "$1")"
+}
+
+collect_existing_macs() {
+	local section mac file
+
+	GENERATED_MACS=""
+	config_load "$CONFIG"
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=wifi.*/\1/p"); do
+		config_get mac "$section" macaddr ""
+		[ -n "$mac" ] && remember_mac "$mac"
+	done
+
+	for file in /sys/class/net/*/address; do
+		[ -f "$file" ] || continue
+		mac="$(cat "$file" 2>/dev/null)"
+		case "$mac" in
+			""|00:00:00:00:00:00|ff:ff:ff:ff:ff:ff)
+				continue
+				;;
+		esac
+		remember_mac "$mac"
+	done
+}
+
+generate_unique_mac() {
+	local tries mac
+
+	tries=0
+	while [ "$tries" -lt 100 ]; do
+		mac="$(generate_random_mac)"
+		if ! mac_is_known "$mac"; then
+			remember_mac "$mac"
+			echo "$mac"
+			return 0
+		fi
+		tries=$((tries + 1))
+	done
+
+	die "failed to generate a unique Wi-Fi MAC"
+}
+
+prepare_mac_batch() {
+	local mode="$1"
+	local tries mac
+
+	MAC_MODE="$mode"
+	MAC_BASE=""
+	MAC_VENDOR=""
+	MAC_STRIDE=8
+
+	case "$mode" in
+		auto|random)
+			return 0
+			;;
+		ap|vendor)
+			tries=0
+			while [ "$tries" -lt 100 ]; do
+				if [ "$mode" = "vendor" ]; then
+					prepare_vendor_group_base
+				else
+					MAC_BASE="$(generate_laa_group_base)"
+				fi
+				if ! mac_is_known "$MAC_BASE"; then
+					return 0
+				fi
+				tries=$((tries + 1))
+			done
+			die "failed to generate a unique Wi-Fi MAC base"
+			;;
+	esac
+}
+
+generate_batch_mac() {
+	local index="$1"
+	local mac offset
+
+	case "$MAC_MODE" in
+		auto)
+			return 0
+			;;
+		random)
+			generate_unique_mac
+			return 0
+			;;
+		ap|vendor)
+			offset=$((index * MAC_STRIDE))
+			mac="$(mac_add "$MAC_BASE" "$offset")"
+			mac_is_known "$mac" && die "generated MAC collision: $mac"
+			remember_mac "$mac"
+			echo "$mac"
+			return 0
+			;;
+	esac
+}
+
+store_mac_metadata() {
+	local mode="$1"
+
+	uci set "$CONFIG.main.mac_mode=$mode"
+	if [ "$mode" = "ap" ] || [ "$mode" = "vendor" ]; then
+		uci set "$CONFIG.main.mac_base=$MAC_BASE"
+		[ -n "$MAC_VENDOR" ] && uci set "$CONFIG.main.mac_vendor=$MAC_VENDOR" || uci -q delete "$CONFIG.main.mac_vendor"
+	else
+		uci -q delete "$CONFIG.main.mac_base"
+		uci -q delete "$CONFIG.main.mac_vendor"
+	fi
+}
+
+delete_vlan_wifi_sections() {
+	local section
+
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=\(vlan\|wifi\).*/\1/p"); do
+		uci -q delete "$CONFIG.$section"
+	done
+}
+
+word_at() {
+	local want="$1"
+	local index=1
+	local value
+	shift
+
+	for value in "$@"; do
+		if [ "$index" -eq "$want" ]; then
+			echo "$value"
+			return 0
+		fi
+		index=$((index + 1))
+	done
+
+	return 1
+}
+
+valid_ipv4_prefix2() {
+	local a b
+
+	case "$1" in
+		*.*)
+			a="${1%%.*}"
+			b="${1#*.}"
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	case "$a:$b" in
+		*[^0-9:]*|:*|*:|*::*)
+			return 1
+			;;
+	esac
+
+	[ "$a" -ge 1 ] 2>/dev/null && [ "$a" -le 223 ] 2>/dev/null && [ "$b" -ge 0 ] 2>/dev/null && [ "$b" -le 255 ] 2>/dev/null
+}
+
+valid_ipv4_host_octet() {
+	case "$1" in
+		""|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 254 ] 2>/dev/null
+}
+
+cmd_batch_generate() {
+	local start="${1:-1}"
+	local count="${2:-4}"
+	local step="${3:-1}"
+	local network_prefix="${4:-vlan}"
+	local ssid_prefix="${5:-WiFi}"
+	local key="$6"
+	local uplink="${7:-lan1}"
+	local access_csv="${8:-}"
+	local mac_mode mode
+	mac_mode="$(normalize_mac_mode "${9:-auto}")" || die "mac mode must be auto, random, ap, or vendor"
+	mode="${10:-replace}"
+	local manage_vlan="${11:-254}"
+	local manage_access_port="${12:-lan2}"
+	local ip_prefix="${13:-172.16}"
+	local gateway_host="${14:-1}"
+	local manage_host="${15:-254}"
+	local access_ports port n id network section wifi_section ssid access_port mac
+	local manage_network manage_section manage_wifi_section manage_ssid manage_ip gateway
+
+	case "$start:$count:$step" in
+		*[^0-9:]*|:*|*:|*::*)
+			die "start, count, and step must be numbers"
+			;;
+	esac
+	[ "$count" -ge 1 ] 2>/dev/null && [ "$count" -le 32 ] 2>/dev/null || die "count must be between 1 and 32"
+	[ "$step" -ge 1 ] 2>/dev/null || die "step must be at least 1"
+	valid_name "$network_prefix" || die "invalid network prefix: $network_prefix"
+	[ -n "$ssid_prefix" ] || die "ssid prefix is required"
+	validate_plain_wifi_key "$key"
+	valid_device_name "$uplink" || die "invalid uplink port: $uplink"
+	valid_vlan_id "$manage_vlan" || die "invalid management VLAN id: $manage_vlan"
+	valid_device_name "$manage_access_port" || die "invalid management access port: $manage_access_port"
+	[ "$manage_access_port" != "$uplink" ] || die "uplink port $uplink cannot be the management access port"
+	valid_ipv4_prefix2 "$ip_prefix" || die "invalid IP prefix: $ip_prefix"
+	valid_ipv4_host_octet "$gateway_host" || die "invalid RouterOS gateway host: $gateway_host"
+	valid_ipv4_host_octet "$manage_host" || die "invalid AP management host: $manage_host"
+	[ "$gateway_host" != "$manage_host" ] || die "RouterOS gateway host and AP management host cannot be the same"
+
+	case "$mode" in
+		replace|append) ;;
+		*) die "mode must be replace or append" ;;
+	esac
+
+	access_ports="$(echo "$access_csv" | tr ',' ' ')"
+	for port in $access_ports; do
+		valid_device_name "$port" || die "invalid access port: $port"
+		[ "$port" != "$uplink" ] || die "uplink port $uplink cannot be an access port"
+		[ "$port" != "$manage_access_port" ] || die "management access port $manage_access_port cannot also be a business access port"
+	done
+
+	manage_network="${network_prefix}${manage_vlan}"
+	manage_section="$manage_network"
+	manage_wifi_section="${manage_network}_wifi"
+	manage_ssid="${ssid_prefix}-${manage_vlan}"
+	manage_ip="${ip_prefix}.${manage_vlan}.${manage_host}"
+	gateway="${ip_prefix}.${manage_vlan}.${gateway_host}"
+
+	valid_name "$manage_network" || die "generated management network name is invalid: $manage_network"
+
+	[ "$(uci -q get "$CONFIG.main")" = "global" ] || uci set "$CONFIG.main=global"
+	[ "$mode" = "replace" ] && delete_vlan_wifi_sections
+
+	UPLINK="$uplink"
+	collect_existing_macs
+	prepare_mac_batch "$mac_mode"
+
+	n=0
+	while [ "$n" -lt "$count" ]; do
+		id=$((start + n * step))
+		valid_vlan_id "$id" || die "generated VLAN id is out of range: $id"
+		[ "$id" != "$manage_vlan" ] || die "business VLAN $id collides with management VLAN $manage_vlan"
+		network="${network_prefix}${id}"
+		section="$network"
+		wifi_section="${network}_wifi"
+		ssid="${ssid_prefix}-${id}"
+		access_port="$(word_at $((n + 1)) $access_ports)"
+		mac="$(generate_batch_mac "$n")"
+
+		valid_name "$network" || die "generated network name is invalid: $network"
+		[ "$section" != "main" ] || die "network name main is reserved"
+		if [ "$mode" = "append" ] && uci -q get "$CONFIG.$section" >/dev/null; then
+			die "section already exists: $section"
+		fi
+		if [ "$mode" = "append" ] && uci -q get "$CONFIG.$wifi_section" >/dev/null; then
+			die "section already exists: $wifi_section"
+		fi
+
+		add_preset_vlan "$section" "$id" "$network" "$access_port"
+		add_preset_wifi "$wifi_section" "$network" "$ssid" "$key" "$mac"
+
+		n=$((n + 1))
+	done
+
+	if [ "$mode" = "append" ] && uci -q get "$CONFIG.$manage_section" >/dev/null; then
+		die "section already exists: $manage_section"
+	fi
+	if [ "$mode" = "append" ] && uci -q get "$CONFIG.$manage_wifi_section" >/dev/null; then
+		die "section already exists: $manage_wifi_section"
+	fi
+
+	mac="$(generate_batch_mac "$count")"
+	add_preset_vlan "$manage_section" "$manage_vlan" "$manage_network" "$manage_access_port"
+	add_preset_wifi "$manage_wifi_section" "$manage_network" "$manage_ssid" "$key" "$mac"
+
+	uci set "$CONFIG.main.enabled=1"
+	uci set "$CONFIG.main.uplink=$uplink"
+	uci set "$CONFIG.main.manage_network=$manage_network"
+	uci set "$CONFIG.main.manage_vlan=$manage_vlan"
+	uci set "$CONFIG.main.bridge=br-vlanap"
+	uci set "$CONFIG.main.manage_ip=$manage_ip"
+	uci set "$CONFIG.main.manage_netmask=255.255.255.0"
+	uci set "$CONFIG.main.gateway=$gateway"
+	uci set "$CONFIG.main.dns=$gateway"
+	uci set "$CONFIG.main.safe_timeout=180"
+	uci set "$CONFIG.main.disable_existing_wifi=1"
+	uci set "$CONFIG.main.disable_all_dhcp=1"
+	uci set "$CONFIG.main.manage_firewall_zone=vlanap_mgmt"
+	store_mac_metadata "$mac_mode"
+
+	uci commit "$CONFIG"
+	log "generated $count business VLAN/Wi-Fi entries plus management VLAN $manage_vlan"
+	log "management: $manage_ssid vlan=$manage_vlan ip=$manage_ip gateway=$gateway"
+}
+
+cmd_mac_generate() {
+	local target="${1:-all}"
+	local mode section mac count index
+
+	mode="$(normalize_mac_mode "${2:-random}")" || die "mac mode must be auto, random, ap, or vendor"
+
+	collect_existing_macs
+	prepare_mac_batch "$mode"
+
+	if [ "$target" = "all" ]; then
+		count=0
+		index=0
+		for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=wifi.*/\1/p"); do
+			if [ "$mode" = "auto" ]; then
+				uci -q delete "$CONFIG.$section.macaddr"
+				echo "$section auto"
+			else
+				mac="$(generate_batch_mac "$index")"
+				uci set "$CONFIG.$section.macaddr=$mac"
+				echo "$section $mac"
+			fi
+			count=$((count + 1))
+			index=$((index + 1))
+		done
+		[ "$count" -gt 0 ] || die "no wifi section found"
+		store_mac_metadata "$mode"
+		uci commit "$CONFIG"
+		return 0
+	fi
+
+	[ "$(uci -q get "$CONFIG.$target")" = "wifi" ] || die "wifi section not found: $target"
+	if [ "$mode" = "auto" ]; then
+		uci -q delete "$CONFIG.$target.macaddr"
+		echo "$target auto"
+	else
+		mac="$(generate_batch_mac 0)"
+		uci set "$CONFIG.$target.macaddr=$mac"
+		echo "$target $mac"
+	fi
+	uci commit "$CONFIG"
+}
+
+cmd_mac_clear() {
+	local target="${1:-all}"
+	local section count
+
+	if [ "$target" = "all" ]; then
+		count=0
+		for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=wifi.*/\1/p"); do
+			uci -q delete "$CONFIG.$section.macaddr"
+			echo "$section auto"
+			count=$((count + 1))
+		done
+		[ "$count" -gt 0 ] || die "no wifi section found"
+		uci -q delete "$CONFIG.main.mac_base"
+		uci -q delete "$CONFIG.main.mac_vendor"
+		uci set "$CONFIG.main.mac_mode=auto"
+		uci commit "$CONFIG"
+		return 0
+	fi
+
+	[ "$(uci -q get "$CONFIG.$target")" = "wifi" ] || die "wifi section not found: $target"
+	uci -q delete "$CONFIG.$target.macaddr"
+	uci commit "$CONFIG"
+	echo "$target auto"
+}
+
+show_runtime_wifi_macs() {
+	local wanted_ssid="$1"
+	local line iface ssid mac
+
+	command -v iw >/dev/null 2>&1 || return 0
+
+	iw dev 2>/dev/null | while IFS= read -r line; do
+		line="$(echo "$line" | sed 's/^[[:space:]]*//')"
+		case "$line" in
+			Interface\ *)
+				iface="${line#Interface }"
+				;;
+			ssid\ *)
+				ssid="${line#ssid }"
+				if [ "$ssid" = "$wanted_ssid" ] && [ -n "$iface" ] && [ -f "/sys/class/net/$iface/address" ]; then
+					mac="$(cat "/sys/class/net/$iface/address" 2>/dev/null)"
+					[ -n "$mac" ] && echo "  runtime.$iface ssid=$ssid mac=$mac"
+				fi
+				;;
+		esac
+	done
+}
+
+cmd_wifi_status() {
+	local section network ssid mac generated gmac radio
+
+	config_load "$CONFIG"
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=wifi.*/\1/p"); do
+		config_get network "$section" network "-"
+		config_get ssid "$section" ssid "-"
+		config_get mac "$section" macaddr "auto"
+		echo "wifi.$section network=$network ssid=$ssid base_mac=$mac"
+
+		for generated in $(uci -q show wireless | sed -n "s/^wireless\.\(vlanap_${section}_[^.]*\)=wifi-iface.*/\1/p"); do
+			gmac="$(uci -q get "wireless.$generated.macaddr")"
+			radio="$(uci -q get "wireless.$generated.device")"
+			[ -n "$gmac" ] || gmac="auto"
+			echo "  wireless.$generated radio=$radio configured_wireless_mac=$gmac"
+		done
+		show_runtime_wifi_macs "$ssid"
+	done
+}
 write_routeros_basic_preset() {
 	local key="$1"
+	local n id network wifi_section ssid
 
 	[ -n "$key" ] || key="change-this-password"
 
@@ -726,29 +1288,37 @@ write_routeros_basic_preset() {
 	uci set "$CONFIG.main.enabled=1"
 	uci set "$CONFIG.main.bridge=br-vlanap"
 	uci set "$CONFIG.main.uplink=$UPLINK"
-	uci set "$CONFIG.main.manage_network=home"
-	uci set "$CONFIG.main.manage_vlan=10"
-	uci set "$CONFIG.main.manage_ip=172.16.10.2"
+	uci set "$CONFIG.main.manage_network=vlan254"
+	uci set "$CONFIG.main.manage_vlan=254"
+	uci set "$CONFIG.main.manage_ip=172.16.254.254"
 	uci set "$CONFIG.main.manage_netmask=255.255.255.0"
-	uci set "$CONFIG.main.gateway=172.16.10.1"
-	uci set "$CONFIG.main.dns=172.16.10.1"
+	uci set "$CONFIG.main.gateway=172.16.254.1"
+	uci set "$CONFIG.main.dns=172.16.254.1"
 	uci set "$CONFIG.main.safe_timeout=180"
 	uci set "$CONFIG.main.disable_existing_wifi=1"
 	uci set "$CONFIG.main.disable_all_dhcp=1"
 	uci set "$CONFIG.main.manage_firewall_zone=vlanap_mgmt"
+	uci set "$CONFIG.main.mac_mode=auto"
+	uci -q delete "$CONFIG.main.mac_base"
+	uci -q delete "$CONFIG.main.mac_vendor"
 
-	add_preset_vlan home 10 home lan2
-	add_preset_vlan iot 30 iot lan3
-	add_preset_vlan guest 40 guest lan4
+	n=1
+	while [ "$n" -le 4 ]; do
+		id="$n"
+		network="vlan${id}"
+		wifi_section="${network}_wifi"
+		ssid="WiFi-${id}"
+		add_preset_vlan "$network" "$id" "$network" ""
+		add_preset_wifi "$wifi_section" "$network" "$ssid" "$key"
+		n=$((n + 1))
+	done
 
-	add_preset_wifi home_wifi home Home "$key"
-	add_preset_wifi iot_wifi iot IoT "$key"
-	add_preset_wifi guest_wifi guest Guest "$key"
+	add_preset_vlan vlan254 254 vlan254 lan2
+	add_preset_wifi vlan254_wifi vlan254 WiFi-254 "$key"
 
 	uci commit "$CONFIG"
-	log "routeros-basic preset saved"
+	log "routeros-basic preset saved: WiFi-1..WiFi-4 plus WiFi-254 management"
 }
-
 cmd_preset() {
 	local mode="${1:-routeros-basic}"
 	local key="$2"
@@ -808,6 +1378,8 @@ cmd_status() {
 	echo "safe timeout: $SAFE_TIMEOUT"
 	echo "configured VLANs:"
 	show_vlan_status
+	echo "configured Wi-Fi:"
+	cmd_wifi_status
 	echo "generated network sections:"
 	config_load network
 	show_generated_interfaces
@@ -835,6 +1407,21 @@ case "$1" in
 	quick-apply)
 		shift
 		cmd_quick_apply "$@"
+		;;
+	batch-generate)
+		shift
+		cmd_batch_generate "$@"
+		;;
+	mac-generate)
+		shift
+		cmd_mac_generate "$@"
+		;;
+	mac-clear)
+		shift
+		cmd_mac_clear "$1"
+		;;
+	wifi-status)
+		cmd_wifi_status
 		;;
 	backup)
 		make_backup
