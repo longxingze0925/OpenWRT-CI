@@ -27,7 +27,7 @@ Commands:
   confirm     Confirm a safe apply and cancel rollback.
   preset      Create a RouterOS trunk preset in /etc/config/vlanap.
   quick-apply Create the preset and apply it with safe rollback.
-  batch-generate Create business VLAN/Wi-Fi sections plus a management Wi-Fi.
+  batch-generate Create business Wi-Fi sections and their VLAN/network records.
   mac-generate Generate persistent Wi-Fi MACs.
   mac-clear   Clear configured Wi-Fi MAC.
   wifi-status Show configured and running Wi-Fi MAC addresses.
@@ -734,10 +734,12 @@ add_preset_vlan() {
 	local id="$2"
 	local network="$3"
 	local access_port="$4"
+	local sequence="$5"
 
 	uci set "$CONFIG.$section=vlan"
 	uci set "$CONFIG.$section.id=$id"
 	uci set "$CONFIG.$section.network=$network"
+	[ -n "$sequence" ] && uci set "$CONFIG.$section.sequence=$sequence"
 	uci add_list "$CONFIG.$section.tagged_port=$UPLINK"
 	[ -n "$access_port" ] && uci add_list "$CONFIG.$section.untagged_port=$access_port"
 }
@@ -748,6 +750,7 @@ add_preset_wifi() {
 	local ssid="$3"
 	local key="$4"
 	local macaddr="$5"
+	local sequence="$6"
 
 	uci set "$CONFIG.$section=wifi"
 	uci set "$CONFIG.$section.network=$network"
@@ -755,6 +758,7 @@ add_preset_wifi() {
 	uci set "$CONFIG.$section.encryption=psk2+ccmp"
 	uci set "$CONFIG.$section.key=$key"
 	[ -n "$macaddr" ] && uci set "$CONFIG.$section.macaddr=$macaddr"
+	[ -n "$sequence" ] && uci set "$CONFIG.$section.sequence=$sequence"
 }
 
 random_byte_hex() {
@@ -1041,8 +1045,85 @@ valid_ipv4_host_octet() {
 	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 254 ] 2>/dev/null
 }
 
+valid_positive_int() {
+	case "$1" in
+		""|*[!0-9]*)
+			return 1
+			;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null
+}
+
+find_vlan_id_by_network() {
+	local wanted="$1"
+	local section network id
+
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=vlan.*/\1/p"); do
+		network="$(uci -q get "$CONFIG.$section.network")"
+		[ "$network" = "$wanted" ] || continue
+		id="$(uci -q get "$CONFIG.$section.id")"
+		[ -n "$id" ] && echo "$id"
+		return 0
+	done
+
+	return 1
+}
+
+get_existing_max_sequence() {
+	local manage_network="$1"
+	local manage_vlan="$2"
+	local max=0 section seq network fallback
+
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=wifi.*/\1/p"); do
+		network="$(uci -q get "$CONFIG.$section.network")"
+		[ "$network" = "$manage_network" ] && continue
+
+		seq="$(uci -q get "$CONFIG.$section.sequence")"
+		if ! valid_positive_int "$seq"; then
+			fallback="$(find_vlan_id_by_network "$network" || true)"
+			if valid_positive_int "$fallback" && [ "$fallback" != "$manage_vlan" ]; then
+				seq="$fallback"
+			else
+				seq=""
+			fi
+		fi
+
+		if valid_positive_int "$seq" && [ "$seq" -gt "$max" ] 2>/dev/null; then
+			max="$seq"
+		fi
+	done
+
+	echo "$max"
+}
+
+get_next_sequence() {
+	local manage_network="${1:-$MANAGE_NETWORK}"
+	local manage_vlan="${2:-$MANAGE_VLAN}"
+	local stored max next
+
+	stored="$(uci -q get "$CONFIG.main.next_sequence")"
+	max="$(get_existing_max_sequence "$manage_network" "$manage_vlan")"
+	next=$((max + 1))
+
+	if valid_positive_int "$stored" && [ "$stored" -gt "$next" ] 2>/dev/null; then
+		next="$stored"
+	fi
+
+	echo "$next"
+}
+
+store_next_sequence() {
+	local candidate="$1"
+	local current
+
+	current="$(uci -q get "$CONFIG.main.next_sequence")"
+	if ! valid_positive_int "$current" || [ "$candidate" -gt "$current" ] 2>/dev/null; then
+		uci set "$CONFIG.main.next_sequence=$candidate"
+	fi
+}
+
 cmd_batch_generate() {
-	local start="${1:-1}"
+	local start="${1:-auto}"
 	local count="${2:-4}"
 	local step="${3:-1}"
 	local network_prefix="${4:-vlan}"
@@ -1061,9 +1142,9 @@ cmd_batch_generate() {
 	local access_ports port n id network section wifi_section ssid access_port mac
 	local manage_network manage_section manage_wifi_section manage_ssid manage_ip gateway
 
-	case "$start:$count:$step" in
+	case "$count:$step" in
 		*[^0-9:]*|:*|*:|*::*)
-			die "start, count, and step must be numbers"
+			die "count and step must be numbers"
 			;;
 	esac
 	[ "$count" -ge 1 ] 2>/dev/null && [ "$count" -le 32 ] 2>/dev/null || die "count must be between 1 and 32"
@@ -1104,6 +1185,22 @@ cmd_batch_generate() {
 	[ "$(uci -q get "$CONFIG.main")" = "global" ] || uci set "$CONFIG.main=global"
 	[ "$mode" = "replace" ] && delete_vlan_wifi_sections
 
+	if [ "$start" = "auto" ]; then
+		if [ "$mode" = "replace" ]; then
+			start=1
+			uci -q delete "$CONFIG.main.next_sequence"
+		else
+			start="$(get_next_sequence "$manage_network" "$manage_vlan")"
+		fi
+	fi
+
+	case "$start" in
+		""|*[!0-9]*)
+			die "start must be a number or auto"
+			;;
+	esac
+	[ "$start" -ge 1 ] 2>/dev/null || die "start must be at least 1"
+
 	UPLINK="$uplink"
 	collect_existing_macs
 	prepare_mac_batch "$mac_mode"
@@ -1116,7 +1213,7 @@ cmd_batch_generate() {
 		network="${network_prefix}${id}"
 		section="$network"
 		wifi_section="${network}_wifi"
-		ssid="${ssid_prefix}-${id}"
+		ssid="${ssid_prefix}${id}"
 		access_port="$(word_at $((n + 1)) $access_ports)"
 		mac="$(generate_batch_mac "$n")"
 
@@ -1129,22 +1226,19 @@ cmd_batch_generate() {
 			die "section already exists: $wifi_section"
 		fi
 
-		add_preset_vlan "$section" "$id" "$network" "$access_port"
-		add_preset_wifi "$wifi_section" "$network" "$ssid" "$key" "$mac"
+		add_preset_vlan "$section" "$id" "$network" "$access_port" "$id"
+		add_preset_wifi "$wifi_section" "$network" "$ssid" "$key" "$mac" "$id"
 
 		n=$((n + 1))
 	done
 
-	if [ "$mode" = "append" ] && uci -q get "$CONFIG.$manage_section" >/dev/null; then
-		die "section already exists: $manage_section"
+	if ! uci -q get "$CONFIG.$manage_section" >/dev/null; then
+		add_preset_vlan "$manage_section" "$manage_vlan" "$manage_network" "$manage_access_port"
 	fi
-	if [ "$mode" = "append" ] && uci -q get "$CONFIG.$manage_wifi_section" >/dev/null; then
-		die "section already exists: $manage_wifi_section"
+	if ! uci -q get "$CONFIG.$manage_wifi_section" >/dev/null; then
+		mac="$(generate_batch_mac "$count")"
+		add_preset_wifi "$manage_wifi_section" "$manage_network" "$manage_ssid" "$key" "$mac"
 	fi
-
-	mac="$(generate_batch_mac "$count")"
-	add_preset_vlan "$manage_section" "$manage_vlan" "$manage_network" "$manage_access_port"
-	add_preset_wifi "$manage_wifi_section" "$manage_network" "$manage_ssid" "$key" "$mac"
 
 	uci set "$CONFIG.main.enabled=1"
 	uci set "$CONFIG.main.uplink=$uplink"
@@ -1160,9 +1254,10 @@ cmd_batch_generate() {
 	uci set "$CONFIG.main.disable_all_dhcp=1"
 	uci set "$CONFIG.main.manage_firewall_zone=vlanap_mgmt"
 	store_mac_metadata "$mac_mode"
+	store_next_sequence $((start + count * step))
 
 	uci commit "$CONFIG"
-	log "generated $count business VLAN/Wi-Fi entries plus management VLAN $manage_vlan"
+	log "generated $count Wi-Fi entries from internal number $start"
 	log "management: $manage_ssid vlan=$manage_vlan ip=$manage_ip gateway=$gateway"
 }
 
@@ -1299,6 +1394,7 @@ write_routeros_basic_preset() {
 	uci set "$CONFIG.main.disable_all_dhcp=1"
 	uci set "$CONFIG.main.manage_firewall_zone=vlanap_mgmt"
 	uci set "$CONFIG.main.mac_mode=auto"
+	uci set "$CONFIG.main.next_sequence=5"
 	uci -q delete "$CONFIG.main.mac_base"
 	uci -q delete "$CONFIG.main.mac_vendor"
 
@@ -1307,9 +1403,9 @@ write_routeros_basic_preset() {
 		id="$n"
 		network="vlan${id}"
 		wifi_section="${network}_wifi"
-		ssid="WiFi-${id}"
-		add_preset_vlan "$network" "$id" "$network" ""
-		add_preset_wifi "$wifi_section" "$network" "$ssid" "$key"
+		ssid="WiFi${id}"
+		add_preset_vlan "$network" "$id" "$network" "" "$id"
+		add_preset_wifi "$wifi_section" "$network" "$ssid" "$key" "" "$id"
 		n=$((n + 1))
 	done
 
@@ -1317,7 +1413,7 @@ write_routeros_basic_preset() {
 	add_preset_wifi vlan254_wifi vlan254 WiFi-254 "$key"
 
 	uci commit "$CONFIG"
-	log "routeros-basic preset saved: WiFi-1..WiFi-4 plus WiFi-254 management"
+	log "routeros-basic preset saved: WiFi1..WiFi4 plus WiFi-254 management"
 }
 cmd_preset() {
 	local mode="${1:-routeros-basic}"
@@ -1350,12 +1446,17 @@ cmd_restore() {
 }
 
 show_vlan_status() {
-	local section id network
+	local section id network sequence
 
 	for section in $VLAN_SECTIONS; do
 		config_get id "$section" id
 		config_get network "$section" network "$section"
-		echo "  VLAN $id -> $network"
+		config_get sequence "$section" sequence ""
+		if [ -n "$sequence" ]; then
+			echo "  #$sequence VLAN $id -> $network"
+		else
+			echo "  VLAN $id -> $network"
+		fi
 	done
 }
 
@@ -1375,6 +1476,7 @@ cmd_status() {
 	echo "bridge: $BRIDGE"
 	echo "uplink: $UPLINK"
 	echo "management: $MANAGE_NETWORK vlan=$MANAGE_VLAN ip=$MANAGE_IP"
+	echo "next Wi-Fi number: $(get_next_sequence "$MANAGE_NETWORK" "$MANAGE_VLAN")"
 	echo "safe timeout: $SAFE_TIMEOUT"
 	echo "configured VLANs:"
 	show_vlan_status

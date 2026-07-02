@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=vlanap-core
 PKG_VERSION:=0.4.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_MAINTAINER:=longxingze0925
 
 include $(INCLUDE_DIR)/package.mk
